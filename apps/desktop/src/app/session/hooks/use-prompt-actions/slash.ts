@@ -7,6 +7,7 @@ import { parseCommandDispatch, parseSlashCommand, sessionTitle } from '@/lib/cha
 import {
   type CommandsCatalogLike,
   type DesktopActionId,
+  type DesktopCommandSurface,
   type DesktopPickerId,
   desktopSlashUnavailableMessage,
   isDesktopSlashCommand,
@@ -31,7 +32,7 @@ import {
 
 import type { BrowserManageResponse, SessionTitleResponse, SlashExecResponse } from '../../../types'
 
-import { type GatewayRequest, isSessionIdCandidate, renderCommandsCatalog, slashStatusText } from './utils'
+import { type GatewayRequest, isSessionIdCandidate, renderCommandsCatalog, renderRpcResult, slashStatusText } from './utils'
 
 /** Everything a slash handler needs about the invocation it's serving. */
 interface SlashActionCtx {
@@ -219,6 +220,45 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           }
 
           await handleDispatch(dispatch)
+        } catch (err) {
+          renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
+      // `rpc` commands have a dedicated gateway handler — skip slash.exec /
+      // command.dispatch entirely. The response is structured (a JSON RPC
+      // reply, not an inline text stream) so we render it via the generic
+      // `renderRpcResult` shaper that knows the field conventions shared by
+      // session.compress / session.save / session.status / session.usage /
+      // session.steer / process.stop / agents.list.
+      async function runRpc(
+        surface: Extract<DesktopCommandSurface, { kind: 'rpc' }>,
+        ctx: SlashActionCtx
+      ): Promise<void> {
+        const resolved = await withSlashOutput(ctx)
+
+        if (!resolved) {
+          return
+        }
+
+        const { render: renderSlashOutput, sessionId } = resolved
+
+        try {
+          const params = surface.buildParams({
+            arg: ctx.arg,
+            command: ctx.command,
+            name: ctx.name,
+            sessionId
+          })
+
+          // Forward the surface's declared timeout when present; default the
+          // requestGateway layer keeps (30s) is too tight for RPCs that do
+          // real work (e.g. session.compress which makes an LLM summarise
+          // call while holding the history lock — easily 60-120s).
+          const result = await requestGateway<unknown>(surface.rpc, params, surface.timeoutMs)
+          const body = renderRpcResult(result, ctx.name)
+
+          renderSlashOutput(body || `/${ctx.name}: no output`)
         } catch (err) {
           renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
         }
@@ -603,6 +643,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           case 'action':
             return actionHandlers[surface.action](ctx)
+
+          case 'rpc':
+            return runRpc(surface, ctx)
 
           default:
             // exec spec, or an unknown skill / quick command the backend owns.
