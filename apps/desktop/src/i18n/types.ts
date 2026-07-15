@@ -1455,6 +1455,7 @@ export interface Translations {
     subagents: (count: number) => string
     todos: (done: number, total: number) => string
     running: string
+    compressing: string
     stop: string
     dismiss: string
     exit: (code: number) => string

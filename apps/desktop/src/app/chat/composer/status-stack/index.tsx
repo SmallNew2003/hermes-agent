@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { type Translations, useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
+import { $compressActive } from '@/store/compaction'
 import {
   $statusItemsBySession,
   type ComposerStatusItem,
@@ -23,6 +24,7 @@ import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
+import { CompressStatusRow } from './compress-row'
 import { PreviewStatusRow } from './preview-row'
 import { StatusItemRow } from './status-row'
 
@@ -121,6 +123,15 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const previewBlock = <div className="px-1 py-0.5">{previewRows}</div>
 
   const sections: { key: string; node: ReactNode }[] = []
+
+  // Manual /compress indicator, pinned to the top of the stack. This gate is
+  // the single owner of the row's visibility: reading $compressActive here both
+  // shows the shimmer row and keeps the stack itself visible while it runs.
+  const compressActive = useStore($compressActive)
+
+  if (compressActive) {
+    sections.push({ key: 'compress', node: <CompressStatusRow /> })
+  }
 
   for (const group of groups) {
     sections.push({

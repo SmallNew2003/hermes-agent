@@ -15,6 +15,7 @@ import {
 } from '@/lib/desktop-slash-commands'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
+import { setSessionCompressing } from '@/store/compaction'
 import { type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { notify, notifyError } from '@/store/notifications'
 import { setPetScale } from '@/store/pet-gallery'
@@ -243,6 +244,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
         const { render: renderSlashOutput, sessionId } = resolved
 
+        // session.compress can hold the history lock for 60-180s while it makes
+        // an LLM summarise call. Light the manual-compress flag so the thread
+        // shows the same shimmer as auto-compaction; finally clears it on
+        // success, error, or timeout so the animation never sticks.
+        const isCompress = surface.rpc === 'session.compress'
+
         try {
           const params = surface.buildParams({
             arg: ctx.arg,
@@ -250,6 +257,10 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             name: ctx.name,
             sessionId
           })
+
+          if (isCompress) {
+            setSessionCompressing(sessionId, true)
+          }
 
           // Forward the surface's declared timeout when present; default the
           // requestGateway layer keeps (30s) is too tight for RPCs that do
@@ -261,6 +272,10 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           renderSlashOutput(body || `/${ctx.name}: no output`)
         } catch (err) {
           renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+        } finally {
+          if (isCompress) {
+            setSessionCompressing(sessionId, false)
+          }
         }
       }
 

@@ -1953,6 +1953,7 @@ export const zh: Translations = {
     subagents: count => `${count} 个子代理`,
     todos: (done, total) => `任务 ${done}/${total}`,
     running: '运行中',
+    compressing: '正在压缩上下文',
     stop: '停止',
     dismiss: '关闭',
     exit: code => `退出码 ${code}`,

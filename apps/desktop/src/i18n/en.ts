@@ -1778,6 +1778,7 @@ export const en: Translations = {
     subagents: count => `${count} Subagent${count === 1 ? '' : 's'}`,
     todos: (done, total) => `Tasks ${done}/${total}`,
     running: 'Running',
+    compressing: 'Summarizing thread',
     stop: 'Stop',
     dismiss: 'Dismiss',
     exit: code => `exit ${code}`,
