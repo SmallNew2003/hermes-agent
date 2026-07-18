@@ -31,6 +31,23 @@ from hermes_cli.config import cfg_get
 logger = logging.getLogger(__name__)
 
 
+def _coerce_tags(value: Any) -> str:
+    """Normalize tags for storage in the `tags` TEXT column.
+
+    The tool schema declares tags as a list of strings, but the model
+    occasionally sends a plain string (or omits it). SQLite's parameter
+    binder rejects Python lists directly, so we serialize lists to JSON
+    and pass strings through unchanged. Returns "" for None / missing.
+    """
+    if value is None or value == "":
+        return ""
+    if isinstance(value, list):
+        # Drop empties and non-strings; keep the call-site contract simple.
+        cleaned = [str(t) for t in value if isinstance(t, (str, int, float)) and str(t)]
+        return json.dumps(cleaned, ensure_ascii=False)
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas (unchanged from original PR)
 # ---------------------------------------------------------------------------
@@ -64,7 +81,11 @@ FACT_STORE_SCHEMA = {
             "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
-            "tags": {"type": "string", "description": "Comma-separated tags."},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags for the fact. Stored as a JSON array in the tags column.",
+            },
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
@@ -150,7 +171,8 @@ class HolographicMemoryProvider(MemoryProvider):
         _default_db = f"{display_hermes_home()}/memory_store.db"
         return [
             {"key": "db_path", "description": "SQLite database path", "default": _default_db},
-            {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
+            {"key": "auto_extract", "description": "Legacy boolean for regex auto-extract at session end (use auto_extract_strategy instead)", "default": "false", "choices": ["true", "false"]},
+            {"key": "auto_extract_strategy", "description": "How to auto-extract facts at session end: 'off' (default, recommended), 'regex' (heuristic English+Chinese signals, low initial trust), 'llm' (reserved, no-op)", "default": "off", "choices": ["off", "regex", "llm"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
         ]
@@ -235,11 +257,26 @@ class HolographicMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._config.get("auto_extract", False):
-            return
         if not self._store or not messages:
             return
-        self._auto_extract_facts(messages)
+        # auto_extract_strategy: "off" (default), "regex" (heuristic), or "llm"
+        # (caller-driven; this plugin only implements regex). "auto_extract"
+        # remains a boolean shorthand for the legacy "regex" path.
+        strategy = self._config.get("auto_extract_strategy")
+        if strategy is None:
+            strategy = "regex" if self._config.get("auto_extract", False) else "off"
+        if strategy == "off":
+            return
+        if strategy == "regex":
+            self._auto_extract_facts(messages)
+            return
+        # "llm" is reserved — silently no-op here. Future work can dispatch
+        # to an LLM-backed extractor (would need API key + cost budget wiring).
+        logger.debug(
+            "auto_extract_strategy=%r not implemented by holographic regex "
+            "extractor; skipping. Implement LLM-backed extraction separately.",
+            strategy,
+        )
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts."""
@@ -277,7 +314,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 fact_id = store.add_fact(
                     args["content"],
                     category=args.get("category", "general"),
-                    tags=args.get("tags", ""),
+                    tags=_coerce_tags(args.get("tags")),
                 )
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
@@ -329,7 +366,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     int(args["fact_id"]),
                     content=args.get("content"),
                     trust_delta=float(args["trust_delta"]) if "trust_delta" in args else None,
-                    tags=args.get("tags"),
+                    tags=_coerce_tags(args.get("tags")) if "tags" in args else None,
                     category=args.get("category"),
                 )
                 return json.dumps({"updated": updated})
@@ -368,41 +405,110 @@ class HolographicMemoryProvider(MemoryProvider):
     # -- Auto-extraction (on_session_end) ------------------------------------
 
     def _auto_extract_facts(self, messages: list) -> None:
+        # High-confidence: explicit "remember this" framing — strong signal in
+        # both English and Chinese that the user wants durable persistence.
+        # `以后` is excluded as a REMEMBER pattern because it's too common in
+        # any future-tense Chinese sentence ("以后再看看"); it would mark
+        # half of normal conversation as remember-worthy.
+        _REMEMBER_PATTERNS = [
+            re.compile(r'\bremember\s+(?:that\s+)?(.+)', re.IGNORECASE),
+            re.compile(r"记住[:：，“\"]?(.+?)$", re.UNICODE),  # 记住: / 记住，
+            re.compile(r"不要忘了(.+)$", re.UNICODE),  # 不要忘了
+        ]
+        # User preferences (English + Chinese). Bare negative forms (不要/不能/
+        # 必须/拒绝) are NOT included because they false-positive on every
+        # sentence ending in "能不能用" / "必须先做" / "不要漏掉" etc. — too
+        # noisy at the regex layer. Preference is captured via the I-statements
+        # and 习惯/喜欢/要 markers above, or via explicit fact_store calls.
         _PREF_PATTERNS = [
             re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
             re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
+            re.compile(r"我习惯[:：，]?(.+?)$", re.UNICODE),
+            re.compile(r"我要(.+?)$", re.UNICODE),
+            re.compile(r"我喜欢(.+?)$", re.UNICODE),
         ]
+        # Decisions / agreements / project rules (English + Chinese).
         _DECISION_PATTERNS = [
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
+            re.compile(r"我们决定(.+?)$", re.UNICODE),  # 我们决定
+            re.compile(r"约定(.+?)$", re.UNICODE),  # 约定
+            re.compile(r"说好(.+?)$", re.UNICODE),  #说好
         ]
+        # Lower-confidence: directive-shaped phrases that look like workflow
+        # instructions. Catches patterns like "plane 加任务 ..." or
+        # "hermes 自带的 ..." where the user is naming a tool/workflow verb.
+        # Marked category="workflow" with a low initial trust so the agent
+        # (or a later fact_feedback pass) can promote or demote.
+        # Verb set is intentionally broad — Chinese workflow commands use
+        # many common characters (加/做/用/查/看/创/设/配/启动/写/读/跑/同步/
+        # 上传/下载/清/删/改/调/分析...). Conservatively only matches CJK
+        # Unified Ideographs to avoid false-positives on code snippets.
+        _WORKFLOW_PATTERNS = [
+            re.compile(r"^\s*([A-Za-z][\w.-]{1,20})\s+[一-鿿].+", re.UNICODE),
+        ]
+        # Min length to extract — anything shorter is likely a yes/no answer
+        # that doesn't belong in durable memory.
+        _MIN_LEN = 12
+        # Auto-extracted facts start with a low trust score so the
+        # fact_feedback pass can promote confident ones. Static score (not
+        # the store's default_trust) because explicit adds and auto-extracts
+        # should differ.
+        _AUTO_TRUST = 0.2
 
         extracted = 0
         for msg in messages:
             if msg.get("role") != "user":
                 continue
             content = msg.get("content", "")
-            if not isinstance(content, str) or len(content) < 10:
+            if not isinstance(content, str) or len(content) < _MIN_LEN:
                 continue
 
-            for pattern in _PREF_PATTERNS:
+            category = None
+            for pattern in _REMEMBER_PATTERNS:
                 if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="user_pref")
-                        extracted += 1
-                    except Exception:
-                        pass
+                    category = "user_pref"
                     break
+            if category is None:
+                for pattern in _PREF_PATTERNS:
+                    if pattern.search(content):
+                        category = "user_pref"
+                        break
+            if category is None:
+                for pattern in _DECISION_PATTERNS:
+                    if pattern.search(content):
+                        category = "project"
+                        break
+            if category is None:
+                for pattern in _WORKFLOW_PATTERNS:
+                    if pattern.match(content):
+                        category = "workflow"
+                        break
 
-            for pattern in _DECISION_PATTERNS:
-                if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="project")
-                        extracted += 1
-                    except Exception:
-                        pass
-                    break
+            if category is None:
+                continue
+
+            try:
+                self._store.add_fact(
+                    content[:400],
+                    category=category,
+                    tags="auto",
+                )
+                # add_fact uses default_trust; nudge trust down for auto
+                # extractions via direct UPDATE so fact_feedback can promote
+                # the good ones later.
+                try:
+                    self._store._conn.execute(
+                        "UPDATE facts SET trust_score = ? WHERE content = ? AND trust_score = ?",
+                        (_AUTO_TRUST, content[:400], self._store.default_trust),
+                    )
+                    self._store._conn.commit()
+                except Exception:
+                    pass
+                extracted += 1
+            except Exception:
+                pass
 
         if extracted:
             logger.info("Auto-extracted %d facts from conversation", extracted)
